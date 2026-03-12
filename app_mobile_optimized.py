@@ -965,10 +965,15 @@ else:
         icons = employee_icons
 
     # 页头
+    # 获取北京时间并转换为中文星期
+    now_beijing = datetime.now(BEIJING_TZ)
+    weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    chinese_weekday = weekdays[now_beijing.weekday()]
+
     st.markdown(f"""
     <div class="app-header">
         <div class="title">{COMPANY_NAME}</div>
-        <div class="sub">{datetime.now(BEIJING_TZ).strftime("%Y年%m月%d日 %A")}</div>
+        <div class="sub">{now_beijing.strftime("%Y年%m月%d日")} {chinese_weekday} {now_beijing.strftime("%H:%M")}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -991,13 +996,28 @@ else:
 
     # ========== 工作台 ==========
     if selected == "工作台":
-        st.title(f"👋 早安, {user['name']}")
-        st.markdown("今天是 " + datetime.now(BEIJING_TZ).strftime("%Y年%m月%d日 %A"))
+        # 获取当前北京时间
+        now_beijing = datetime.now(BEIJING_TZ)
+        current_hour = now_beijing.hour
+        current_time_str = now_beijing.strftime("%H:%M:%S")
+
+        # 根据小时确定问候语
+        if 5 <= current_hour < 12:
+            greeting = "早安"
+        elif 12 <= current_hour < 18:
+            greeting = "下午好"
+        else:
+            greeting = "晚上好"
+
+        st.title(f"👋 {greeting}, {user['name']}")
+
+        # 激励语（可自定义或随机）
+        st.markdown("✨ 新的一天，继续加油！")
 
         st.markdown("### 🕒 打卡签到")
 
-        today_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
-        now_time_str = datetime.now(BEIJING_TZ).strftime("%H:%M:%S")
+        today_str = now_beijing.strftime("%Y-%m-%d")
+        now_time_str = now_beijing.strftime("%H:%M:%S")
         record = get_attendance_status(user['id'], today_str)
 
         col1, col2 = st.columns(2)
@@ -1546,7 +1566,6 @@ else:
             st.dataframe(approval_history_display, use_container_width=True, hide_index=True)
         else:
             st.info("暂无审批记录")
-
     # ========== 加班审批 ==========
     elif selected == "加班审批" and user['role'] == 'admin':
         st.title("⏰ 加班审批")
