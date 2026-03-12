@@ -1,10 +1,15 @@
 import sqlite3
 import hashlib
-from datetime import datetime, time
+from datetime import datetime
+import pytz
+
+BEIJING_TZ = pytz.timezone('Asia/Shanghai')
+
 
 def hash_password(password):
     """密码加密函数"""
     return hashlib.sha256(password.encode()).hexdigest()
+
 
 def init_db():
     conn = sqlite3.connect('attendance.db')
@@ -111,7 +116,7 @@ def init_db():
         ('销售部', '市场与销售'),
         ('财务部', '财务与会计')
     ]
-    
+
     for dept in departments:
         try:
             c.execute("INSERT INTO departments (name, description) VALUES (?, ?)", dept)
@@ -125,22 +130,31 @@ def init_db():
 
     # Insert sample users
     users = [
-        ('admin', hash_password('admin123'), 'admin', '系统管理员', dept_dict.get('管理部'), 'admin@company.com', '13800138000', '2023-01-01'),
-        ('user1', hash_password('123456'), 'employee', '张三', dept_dict.get('技术部'), 'user1@company.com', '13800138002', '2023-03-01'),
-        ('user2', hash_password('123456'), 'employee', '李四', dept_dict.get('人事部'), 'user2@company.com', '13800138003', '2023-03-15'),
-        ('user3', hash_password('123456'), 'employee', '王五', dept_dict.get('销售部'), 'user3@company.com', '13800138004', '2023-04-01'),
+        ('admin', hash_password('admin123'), 'admin', '系统管理员', dept_dict.get('管理部'), 'admin@company.com',
+         '13800138000', '2023-01-01'),
+        ('user1', hash_password('123456'), 'employee', '张三', dept_dict.get('技术部'), 'user1@company.com',
+         '13800138002', '2023-03-01'),
+        ('user2', hash_password('123456'), 'employee', '李四', dept_dict.get('人事部'), 'user2@company.com',
+         '13800138003', '2023-03-15'),
+        ('user3', hash_password('123456'), 'employee', '王五', dept_dict.get('销售部'), 'user3@company.com',
+         '13800138004', '2023-04-01'),
     ]
 
     for user in users:
         try:
-            c.execute("INSERT INTO users (username, password, role, name, department_id, email, phone, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", user)
+            c.execute(
+                "INSERT INTO users (username, password, role, name, department_id, email, phone, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                user)
         except sqlite3.IntegrityError:
             pass
 
-    # Insert default attendance rule
+    # Insert default attendance rule (using Beijing time)
     try:
-        default_rule = ('标准考勤规则', '09:00:00', '18:00:00', 15, 15, 8.0, 1, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-        c.execute("INSERT INTO attendance_rules (rule_name, start_time, end_time, late_threshold, early_leave_threshold, work_hours_per_day, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", default_rule)
+        now_beijing = datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')
+        default_rule = ('标准考勤规则', '09:00:00', '18:00:00', 15, 15, 8.0, 1, now_beijing)
+        c.execute(
+            "INSERT INTO attendance_rules (rule_name, start_time, end_time, late_threshold, early_leave_threshold, work_hours_per_day, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            default_rule)
     except sqlite3.IntegrityError:
         pass
 
@@ -149,6 +163,7 @@ def init_db():
     print("✅ 数据库初始化成功！")
     print("✅ 默认管理员账号：admin / admin123")
     print("✅ 测试员工账号：user1, user2, user3 / 123456")
+
 
 if __name__ == '__main__':
     init_db()

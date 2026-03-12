@@ -4,18 +4,23 @@ import pandas as pd
 from datetime import datetime, time, timedelta
 import os
 import hashlib
+import pytz
 from streamlit_option_menu import option_menu
 import altair as alt
 import calendar
 import json
 from dateutil.relativedelta import relativedelta
+import subprocess
+import sys
 
 # --- 系统配置 ---
 COMPANY_NAME = "企业考勤管理系统"
 DB_FILE = 'attendance.db'
-EXPECTED_START_TIME = time(9, 0, 0)  # 规定上班时间
-EXPECTED_END_TIME = time(18, 0, 0)  # 规定下班时间
+EXPECTED_START_TIME = time(9, 0, 0)  # 规定上班时间（北京时间）
+EXPECTED_END_TIME = time(18, 0, 0)  # 规定下班时间（北京时间）
+BEIJING_TZ = pytz.timezone('Asia/Shanghai')
 
+# 页面配置
 st.set_page_config(
     page_title=COMPANY_NAME,
     page_icon="🏢",
@@ -23,10 +28,12 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+
 # --- 移动端检测 ---
 def is_mobile():
     """检测是否是移动设备"""
     return st.session_state.get('is_mobile', False)
+
 
 # --- 自定义CSS样式（包含移动端响应式设计）---
 def load_css():
@@ -362,7 +369,7 @@ def load_css():
             .app-header .title {
                 font-size: 16px;
             }
-            
+
             .app-header .sub {
                 font-size: 11px;
             }
@@ -411,302 +418,216 @@ def load_css():
 load_css()
 
 
-# ==================== 数据库操作函数 ====================
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_db_connection()
-    # 用户表
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            role TEXT DEFAULT 'employee',
-            name TEXT NOT NULL,
-            department_id INTEGER,
-            email TEXT,
-            phone TEXT,
-            hire_date TEXT,
-            FOREIGN KEY (department_id) REFERENCES departments(id)
-        )
-    ''')
-    # 部门表
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS departments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            description TEXT
-        )
-    ''')
-    # 考勤表
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            check_in TEXT,
-            check_out TEXT,
-            status TEXT DEFAULT '正常',
-            notes TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            UNIQUE(user_id, date)
-        )
-    ''')
-    # 请假表
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS leaves (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            leave_type TEXT NOT NULL,
-            start_date TEXT NOT NULL,
-            end_date TEXT NOT NULL,
-            days REAL NOT NULL,
-            reason TEXT,
-            status TEXT DEFAULT 'pending',
-            approved_by INTEGER,
-            approved_at TEXT,
-            created_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (approved_by) REFERENCES users(id)
-        )
-    ''')
-    # 加班表
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS overtime (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            date TEXT NOT NULL,
-            hours REAL NOT NULL,
-            reason TEXT,
-            status TEXT DEFAULT 'pending',
-            approved_by INTEGER,
-            approved_at TEXT,
-            created_at TEXT,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            FOREIGN KEY (approved_by) REFERENCES users(id)
-        )
-    ''')
-    # 操作日志表
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT NOT NULL,
-            detail TEXT,
-            ip TEXT,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ''')
-    # 考勤规则表
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS attendance_rules (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            rule_name TEXT NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT NOT NULL,
-            late_threshold INTEGER DEFAULT 15,
-            early_leave_threshold INTEGER DEFAULT 15,
-            work_hours_per_day REAL DEFAULT 8.0,
-            is_active INTEGER DEFAULT 1,
-            created_at TEXT
-        )
-    ''')
-    # 插入默认部门
-    depts = [
-        ('技术部', '负责技术研发'),
-        ('人事部', '负责人力资源'),
-        ('财务部', '负责财务管理'),
-        ('销售部', '负责销售业务')
-    ]
-    for name, desc in depts:
-        conn.execute('INSERT OR IGNORE INTO departments (name, description) VALUES (?, ?)', (name, desc))
-    # 插入默认管理员（姓名为"马乐"）
-    admin_exists = conn.execute("SELECT 1 FROM users WHERE username = 'admin'").fetchone()
-    if not admin_exists:
-        conn.execute(
-            "INSERT INTO users (username, password, role, name, department_id, hire_date) VALUES (?, ?, ?, ?, ?, ?)",
-            ('admin', hash_password('admin123'), 'admin', '马乐', 1, datetime.now().strftime('%Y-%m-%d'))
-        )
-    # 插入默认考勤规则
-    rule_exists = conn.execute("SELECT 1 FROM attendance_rules WHERE is_active = 1").fetchone()
-    if not rule_exists:
-        conn.execute('''
-            INSERT INTO attendance_rules (rule_name, start_time, end_time, late_threshold, early_leave_threshold, work_hours_per_day, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            '默认规则', EXPECTED_START_TIME.strftime('%H:%M:%S'), EXPECTED_END_TIME.strftime('%H:%M:%S'), 15, 15, 8.0, 1,
-            datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    conn.commit()
-    conn.close()
+# ==================== 数据库初始化（自动执行） ====================
+def init_db_if_not_exists():
+    """如果数据库文件不存在，则调用 init_db.py 初始化"""
+    if not os.path.exists(DB_FILE):
+        st.info("检测到数据库不存在，正在初始化...")
+        try:
+            # 尝试导入 init_db 并执行初始化
+            import init_db
+            init_db.init_db()
+            st.success("数据库初始化完成！")
+        except ImportError:
+            # 如果导入失败（例如 init_db.py 不在同一目录），则通过子进程执行
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            init_script = os.path.join(script_dir, 'init_db.py')
+            if os.path.exists(init_script):
+                subprocess.run([sys.executable, init_script], check=True)
+                st.success("数据库初始化完成！")
+            else:
+                st.error("找不到 init_db.py，无法初始化数据库，请手动执行初始化。")
+        except Exception as e:
+            st.error(f"数据库初始化失败: {e}")
 
 
-def log_action(user_id, action, detail='', ip=None):
-    try:
-        conn = get_db_connection()
-        conn.execute(
-            "INSERT INTO logs (user_id, action, detail, ip, created_at) VALUES (?, ?, ?, ?, ?)",
-            (user_id, action, detail, ip, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-        )
-        conn.commit()
-        conn.close()
-    except:
-        pass
+# 应用启动时执行数据库初始化检查
+init_db_if_not_exists()
 
+
+# ==================== 数据库操作函数（全部使用 with 上下文） ====================
 
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 
-def login_user(username, password):
-    conn = get_db_connection()
-    user = conn.execute('''
-        SELECT u.*, d.name as department 
-        FROM users u 
-        LEFT JOIN departments d ON u.department_id = d.id 
-        WHERE u.username = ?
-    ''', (username,)).fetchone()
-    conn.close()
-    if user and user['password'] == hash_password(password):
-        log_action(user['id'], '登录', f'用户 {username} 登录成功')
-        return user
+def verify_login(username, password):
+    """
+    登录验证：
+    1. 优先匹配 secrets 中的超级管理员
+    2. 失败则查询 SQLite 普通用户
+    """
+    # 1. 超级管理员验证
+    try:
+        admin_user = st.secrets.get("ADMIN_USER")
+        admin_pass = st.secrets.get("ADMIN_PASSWORD")
+        if admin_user and admin_pass and username == admin_user and password == admin_pass:
+            # 构造一个虚拟管理员用户（不存储在数据库中）
+            return {
+                'id': -1,  # 特殊 ID 表示超管
+                'username': admin_user,
+                'name': '超级管理员',
+                'role': 'admin',
+                'department': '管理部',
+                'department_id': None,
+                'email': '',
+                'phone': ''
+            }
+    except Exception:
+        # secrets 未配置或读取失败，跳过
+        pass
+
+    # 2. 普通用户验证（查询数据库）
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        user = conn.execute('''
+            SELECT u.*, d.name as department 
+            FROM users u 
+            LEFT JOIN departments d ON u.department_id = d.id 
+            WHERE u.username = ?
+        ''', (username,)).fetchone()
+        if user and user['password'] == hash_password(password):
+            return dict(user)
     return None
 
 
+def log_action(user_id, action, detail='', ip=None):
+    """记录操作日志"""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO logs (user_id, action, detail, ip, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, action, detail, ip, datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S'))
+            )
+            conn.commit()
+    except:
+        pass
+
+
 def register_user(username, password, name, department_id=None, email=None, phone=None):
-    conn = get_db_connection()
-    exists = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
-    if exists:
-        conn.close()
-        return False, "用户名已存在"
-    conn.execute(
-        "INSERT INTO users (username, password, role, name, department_id, email, phone, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (username, hash_password(password), "employee", name, department_id, email, phone,
-         datetime.now().strftime("%Y-%m-%d")),
-    )
-    conn.commit()
-    conn.close()
+    """注册新用户（普通员工）"""
+    with sqlite3.connect(DB_FILE) as conn:
+        exists = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
+        if exists:
+            return False, "用户名已存在"
+        conn.execute(
+            "INSERT INTO users (username, password, role, name, department_id, email, phone, hire_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (username, hash_password(password), "employee", name, department_id, email, phone,
+             datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")),
+        )
+        conn.commit()
     return True, "注册成功，请使用新账号登录"
 
 
 def update_user(user_id, username, name, department_id, role, email=None, phone=None):
-    conn = get_db_connection()
-    try:
-        conn.execute("""
-            UPDATE users 
-            SET username=?, name=?, department_id=?, role=?, email=?, phone=?
-            WHERE id=?
-        """, (username, name, department_id, role, email, phone, user_id))
-        conn.commit()
-        return True, "更新成功"
-    except Exception as e:
-        return False, f"更新失败: {e}"
-    finally:
-        conn.close()
+    """更新用户信息"""
+    with sqlite3.connect(DB_FILE) as conn:
+        try:
+            conn.execute("""
+                UPDATE users 
+                SET username=?, name=?, department_id=?, role=?, email=?, phone=?
+                WHERE id=?
+            """, (username, name, department_id, role, email, phone, user_id))
+            conn.commit()
+            return True, "更新成功"
+        except Exception as e:
+            return False, f"更新失败: {e}"
 
 
 def delete_user(user_id):
-    conn = get_db_connection()
-    try:
-        conn.execute("DELETE FROM attendance WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM leaves WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM overtime WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM logs WHERE user_id=?", (user_id,))
-        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
-        conn.commit()
-        return True, "删除成功"
-    except Exception as e:
-        return False, f"删除失败: {e}"
-    finally:
-        conn.close()
+    """删除用户及相关记录"""
+    with sqlite3.connect(DB_FILE) as conn:
+        try:
+            conn.execute("DELETE FROM attendance WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM leaves WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM overtime WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM logs WHERE user_id=?", (user_id,))
+            conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            conn.commit()
+            return True, "删除成功"
+        except Exception as e:
+            return False, f"删除失败: {e}"
 
 
 def get_attendance_status(user_id, date_str):
-    conn = get_db_connection()
-    record = conn.execute('SELECT * FROM attendance WHERE user_id = ? AND date = ?', (user_id, date_str)).fetchone()
-    conn.close()
-    return record
+    """获取某天考勤记录"""
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        record = conn.execute('SELECT * FROM attendance WHERE user_id = ? AND date = ?', (user_id, date_str)).fetchone()
+        return dict(record) if record else None
 
 
 def clock_in(user_id, date_str, time_str):
-    conn = get_db_connection()
-    existing = conn.execute('SELECT * FROM attendance WHERE user_id = ? AND date = ?', (user_id, date_str)).fetchone()
-    if existing:
-        conn.close()
-        return False, "今日已打卡"
-    check_in_dt = datetime.strptime(time_str, "%H:%M:%S").time()
-    status = "正常" if check_in_dt <= EXPECTED_START_TIME else "迟到"
-    conn.execute('INSERT INTO attendance (user_id, date, check_in, status) VALUES (?, ?, ?, ?)',
-                 (user_id, date_str, time_str, status))
-    conn.commit()
-    conn.close()
+    """上班打卡"""
+    with sqlite3.connect(DB_FILE) as conn:
+        existing = conn.execute('SELECT * FROM attendance WHERE user_id = ? AND date = ?',
+                                (user_id, date_str)).fetchone()
+        if existing:
+            return False, "今日已打卡"
+        check_in_dt = datetime.strptime(time_str, "%H:%M:%S").time()
+        status = "正常" if check_in_dt <= EXPECTED_START_TIME else "迟到"
+        conn.execute('INSERT INTO attendance (user_id, date, check_in, status) VALUES (?, ?, ?, ?)',
+                     (user_id, date_str, time_str, status))
+        conn.commit()
     log_action(user_id, '上班打卡', f'时间 {time_str} 状态 {status}')
-    if status == "迟到":
-        return False, "已记录迟到"
-    return True, "打卡成功"
+    return True, "打卡成功" if status == "正常" else "已记录迟到"
 
 
 def clock_out(user_id, date_str, time_str):
-    conn = get_db_connection()
-    record = conn.execute('SELECT check_in, status FROM attendance WHERE user_id = ? AND date = ?',
-                          (user_id, date_str)).fetchone()
-    if not record:
-        conn.close()
-        return False, "请先完成上班打卡"
-    conn.execute('UPDATE attendance SET check_out = ? WHERE user_id = ? AND date = ?',
-                 (time_str, user_id, date_str))
-    check_out_time = datetime.strptime(time_str, "%H:%M:%S").time()
-    current_status = record['status']
-    new_status = current_status
-    if check_out_time < EXPECTED_END_TIME:
-        if current_status == "迟到":
-            new_status = "迟到早退"
-        elif current_status == "正常":
-            new_status = "早退"
-    if new_status != current_status:
-        conn.execute('UPDATE attendance SET status = ? WHERE user_id = ? AND date = ?',
-                     (new_status, user_id, date_str))
-    conn.commit()
-    conn.close()
+    """下班打卡"""
+    with sqlite3.connect(DB_FILE) as conn:
+        record = conn.execute('SELECT check_in, status FROM attendance WHERE user_id = ? AND date = ?',
+                              (user_id, date_str)).fetchone()
+        if not record:
+            return False, "请先完成上班打卡"
+        conn.execute('UPDATE attendance SET check_out = ? WHERE user_id = ? AND date = ?',
+                     (time_str, user_id, date_str))
+        check_out_time = datetime.strptime(time_str, "%H:%M:%S").time()
+        current_status = record[1]
+        new_status = current_status
+        if check_out_time < EXPECTED_END_TIME:
+            if current_status == "迟到":
+                new_status = "迟到早退"
+            elif current_status == "正常":
+                new_status = "早退"
+        if new_status != current_status:
+            conn.execute('UPDATE attendance SET status = ? WHERE user_id = ? AND date = ?',
+                         (new_status, user_id, date_str))
+        conn.commit()
     log_action(user_id, '下班打卡', f'时间 {time_str} 状态 {new_status}')
     return True, "下班打卡成功"
 
 
 def get_all_attendance():
-    conn = get_db_connection()
-    query = """
-        SELECT a.id, u.name, d.name as department, a.date, a.check_in, a.check_out, a.status
-        FROM attendance a
-        JOIN users u ON a.user_id = u.id
-        LEFT JOIN departments d ON u.department_id = d.id
-        ORDER BY a.date DESC, a.check_in ASC
-    """
-    df = pd.read_sql_query(query, conn)
-    conn.close()
+    """获取所有考勤记录（用于报表）"""
+    with sqlite3.connect(DB_FILE) as conn:
+        query = """
+            SELECT a.id, u.name, d.name as department, a.date, a.check_in, a.check_out, a.status
+            FROM attendance a
+            JOIN users u ON a.user_id = u.id
+            LEFT JOIN departments d ON u.department_id = d.id
+            ORDER BY a.date DESC, a.check_in ASC
+        """
+        df = pd.read_sql_query(query, conn)
     return df
 
 
 def get_departments():
-    conn = get_db_connection()
-    df = pd.read_sql_query("SELECT id, name, description FROM departments ORDER BY name", conn)
-    conn.close()
+    """获取部门列表"""
+    with sqlite3.connect(DB_FILE) as conn:
+        df = pd.read_sql_query("SELECT id, name, description FROM departments ORDER BY name", conn)
     return df
 
 
 def get_attendance_rules():
-    conn = get_db_connection()
-    df = pd.read_sql_query("SELECT * FROM attendance_rules WHERE is_active = 1", conn)
-    conn.close()
+    """获取当前激活的考勤规则"""
+    with sqlite3.connect(DB_FILE) as conn:
+        df = pd.read_sql_query("SELECT * FROM attendance_rules WHERE is_active = 1", conn)
     return df
 
 
 def calculate_work_hours(check_in_str, check_out_str):
+    """计算实际工时（扣除午餐1.5小时）"""
     if not check_in_str or not check_out_str:
         return 0
     try:
@@ -723,210 +644,207 @@ def calculate_work_hours(check_in_str, check_out_str):
 
 
 def apply_leave(user_id, leave_type, start_date, end_date, reason):
-    conn = get_db_connection()
+    """提交请假申请"""
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
     days = (end - start).days + 1
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        conn.execute("""
-            INSERT INTO leaves (user_id, leave_type, start_date, end_date, days, reason, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, leave_type, start_date, end_date, days, reason, created_at))
-        conn.commit()
-        conn.close()
-        log_action(user_id, '申请请假', f'{leave_type} {start_date}~{end_date} 共{days}天')
-        return True, "请假申请提交成功"
-    except Exception as e:
-        conn.close()
-        return False, f"提交失败: {str(e)}"
+    created_at = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_FILE) as conn:
+        try:
+            conn.execute("""
+                INSERT INTO leaves (user_id, leave_type, start_date, end_date, days, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, leave_type, start_date, end_date, days, reason, created_at))
+            conn.commit()
+        except Exception as e:
+            return False, f"提交失败: {str(e)}"
+    log_action(user_id, '申请请假', f'{leave_type} {start_date}~{end_date} 共{days}天')
+    return True, "请假申请提交成功"
 
 
 def get_leave_applications(user_id=None, status=None):
-    conn = get_db_connection()
-    query = """
-        SELECT l.*, u.name as applicant_name, d.name as department_name, 
-               u2.name as approver_name
-        FROM leaves l
-        JOIN users u ON l.user_id = u.id
-        LEFT JOIN departments d ON u.department_id = d.id
-        LEFT JOIN users u2 ON l.approved_by = u2.id
-    """
-    params = []
-    conditions = []
-    if user_id:
-        conditions.append("l.user_id = ?")
-        params.append(user_id)
-    if status:
-        conditions.append("l.status = ?")
-        params.append(status)
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY l.created_at DESC"
-    df = pd.read_sql_query(query, conn, params=params if params else None)
-    conn.close()
+    """获取请假申请列表"""
+    with sqlite3.connect(DB_FILE) as conn:
+        query = """
+            SELECT l.*, u.name as applicant_name, d.name as department_name, 
+                   u2.name as approver_name
+            FROM leaves l
+            JOIN users u ON l.user_id = u.id
+            LEFT JOIN departments d ON u.department_id = d.id
+            LEFT JOIN users u2 ON l.approved_by = u2.id
+        """
+        params = []
+        conditions = []
+        if user_id:
+            conditions.append("l.user_id = ?")
+            params.append(user_id)
+        if status:
+            conditions.append("l.status = ?")
+            params.append(status)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY l.created_at DESC"
+        df = pd.read_sql_query(query, conn, params=params)
     return df
 
 
 def apply_overtime(user_id, date, hours, reason):
-    conn = get_db_connection()
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        conn.execute("""
-            INSERT INTO overtime (user_id, date, hours, reason, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, date, hours, reason, created_at))
-        conn.commit()
-        conn.close()
-        log_action(user_id, '申请加班', f'{date} 加班{hours}小时')
-        return True, "加班申请提交成功"
-    except Exception as e:
-        conn.close()
-        return False, f"提交失败: {str(e)}"
+    """提交加班申请"""
+    created_at = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_FILE) as conn:
+        try:
+            conn.execute("""
+                INSERT INTO overtime (user_id, date, hours, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (user_id, date, hours, reason, created_at))
+            conn.commit()
+        except Exception as e:
+            return False, f"提交失败: {str(e)}"
+    log_action(user_id, '申请加班', f'{date} 加班{hours}小时')
+    return True, "加班申请提交成功"
 
 
 def get_overtime_applications(user_id=None, status=None):
-    conn = get_db_connection()
-    query = """
-        SELECT o.*, u.name as applicant_name, d.name as department_name,
-               u2.name as approver_name
-        FROM overtime o
-        JOIN users u ON o.user_id = u.id
-        LEFT JOIN departments d ON u.department_id = d.id
-        LEFT JOIN users u2 ON o.approved_by = u2.id
-    """
-    params = []
-    conditions = []
-    if user_id:
-        conditions.append("o.user_id = ?")
-        params.append(user_id)
-    if status:
-        conditions.append("o.status = ?")
-        params.append(status)
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY o.created_at DESC"
-    df = pd.read_sql_query(query, conn, params=params if params else None)
-    conn.close()
+    """获取加班申请列表"""
+    with sqlite3.connect(DB_FILE) as conn:
+        query = """
+            SELECT o.*, u.name as applicant_name, d.name as department_name,
+                   u2.name as approver_name
+            FROM overtime o
+            JOIN users u ON o.user_id = u.id
+            LEFT JOIN departments d ON u.department_id = d.id
+            LEFT JOIN users u2 ON o.approved_by = u2.id
+        """
+        params = []
+        conditions = []
+        if user_id:
+            conditions.append("o.user_id = ?")
+            params.append(user_id)
+        if status:
+            conditions.append("o.status = ?")
+            params.append(status)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY o.created_at DESC"
+        df = pd.read_sql_query(query, conn, params=params)
     return df
 
 
 def approve_overtime(overtime_id, approver_id, action):
-    conn = get_db_connection()
+    """审批加班"""
     status = 'approved' if action == 'approve' else 'rejected'
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        conn.execute("""
-            UPDATE overtime SET status = ?, approved_by = ?, approved_at = ?
-            WHERE id = ?
-        """, (status, approver_id, now, overtime_id))
-        conn.commit()
-        conn.close()
-        log_action(approver_id, '审批加班', f'加班申请 {overtime_id} 状态 {status}')
-        return True
-    except Exception as e:
-        conn.close()
-        return False
+    now = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(DB_FILE) as conn:
+        try:
+            conn.execute("""
+                UPDATE overtime SET status = ?, approved_by = ?, approved_at = ?
+                WHERE id = ?
+            """, (status, approver_id, now, overtime_id))
+            conn.commit()
+        except Exception as e:
+            return False
+    log_action(approver_id, '审批加班', f'加班申请 {overtime_id} 状态 {status}')
+    return True
 
 
 def get_monthly_attendance_stats(year, month):
-    conn = get_db_connection()
-    query = """
-        SELECT 
-            u.id,
-            u.name,
-            u.department_id,
-            d.name as department_name,
-            COUNT(a.id) as attendance_days,
-            SUM(CASE WHEN a.status IN ('正常') THEN 1 ELSE 0 END) as normal_days,
-            SUM(CASE WHEN a.status IN ('迟到','迟到早退') THEN 1 ELSE 0 END) as late_days,
-            SUM(CASE WHEN a.status IN ('早退','迟到早退') THEN 1 ELSE 0 END) as early_leave_days,
-            SUM(CASE WHEN a.status = '缺勤' THEN 1 ELSE 0 END) as absent_days
-        FROM users u
-        LEFT JOIN departments d ON u.department_id = d.id
-        LEFT JOIN attendance a ON u.id = a.user_id 
-            AND strftime('%Y', a.date) = ? 
-            AND strftime('%m', a.date) = ?
-        WHERE u.role = 'employee'
-        GROUP BY u.id, u.name, u.department_id, d.name
-        ORDER BY d.name, u.name
-    """
-    df = pd.read_sql_query(query, conn, params=(str(year), f"{month:02d}"))
-    conn.close()
+    """月度考勤统计"""
+    with sqlite3.connect(DB_FILE) as conn:
+        query = """
+            SELECT 
+                u.id,
+                u.name,
+                u.department_id,
+                d.name as department_name,
+                COUNT(a.id) as attendance_days,
+                SUM(CASE WHEN a.status IN ('正常') THEN 1 ELSE 0 END) as normal_days,
+                SUM(CASE WHEN a.status IN ('迟到','迟到早退') THEN 1 ELSE 0 END) as late_days,
+                SUM(CASE WHEN a.status IN ('早退','迟到早退') THEN 1 ELSE 0 END) as early_leave_days,
+                SUM(CASE WHEN a.status = '缺勤' THEN 1 ELSE 0 END) as absent_days
+            FROM users u
+            LEFT JOIN departments d ON u.department_id = d.id
+            LEFT JOIN attendance a ON u.id = a.user_id 
+                AND strftime('%Y', a.date) = ? 
+                AND strftime('%m', a.date) = ?
+            WHERE u.role = 'employee'
+            GROUP BY u.id, u.name, u.department_id, d.name
+            ORDER BY d.name, u.name
+        """
+        df = pd.read_sql_query(query, conn, params=(str(year), f"{month:02d}"))
     return df
 
 
 def get_attendance_trend(days=30):
-    conn = get_db_connection()
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    query = """
-        SELECT 
-            date,
-            COUNT(*) as total_attendance,
-            SUM(CASE WHEN status IN ('正常') THEN 1 ELSE 0 END) as normal_count,
-            SUM(CASE WHEN status IN ('迟到','迟到早退') THEN 1 ELSE 0 END) as late_count,
-            SUM(CASE WHEN status IN ('早退','迟到早退') THEN 1 ELSE 0 END) as early_leave_count
-        FROM attendance
-        WHERE date BETWEEN ? AND ?
-        GROUP BY date
-        ORDER BY date
-    """
-    df = pd.read_sql_query(query, conn, params=(start_date, end_date))
-    conn.close()
+    """考勤趋势（过去N天）"""
+    end_date = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+    start_date = (datetime.now(BEIJING_TZ) - timedelta(days=days)).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_FILE) as conn:
+        query = """
+            SELECT 
+                date,
+                COUNT(*) as total_attendance,
+                SUM(CASE WHEN status IN ('正常') THEN 1 ELSE 0 END) as normal_count,
+                SUM(CASE WHEN status IN ('迟到','迟到早退') THEN 1 ELSE 0 END) as late_count,
+                SUM(CASE WHEN status IN ('早退','迟到早退') THEN 1 ELSE 0 END) as early_leave_count
+            FROM attendance
+            WHERE date BETWEEN ? AND ?
+            GROUP BY date
+            ORDER BY date
+        """
+        df = pd.read_sql_query(query, conn, params=(start_date, end_date))
     return df
 
 
 def get_logs(user_id=None, limit=100):
-    conn = get_db_connection()
-    query = """
-        SELECT l.*, u.name as user_name
-        FROM logs l
-        LEFT JOIN users u ON l.user_id = u.id
-        ORDER BY l.created_at DESC
-        LIMIT ?
-    """
-    df = pd.read_sql_query(query, conn, params=(limit,))
-    conn.close()
+    """获取操作日志"""
+    with sqlite3.connect(DB_FILE) as conn:
+        query = """
+            SELECT l.*, u.name as user_name
+            FROM logs l
+            LEFT JOIN users u ON l.user_id = u.id
+            ORDER BY l.created_at DESC
+            LIMIT ?
+        """
+        df = pd.read_sql_query(query, conn, params=(limit,))
     return df
 
 
 def update_attendance_record(record_id, check_in=None, check_out=None, status=None, notes=None):
-    conn = get_db_connection()
-    updates = []
-    params = []
-    if check_in is not None:
-        updates.append("check_in = ?")
-        params.append(check_in)
-    if check_out is not None:
-        updates.append("check_out = ?")
-        params.append(check_out)
-    if status is not None:
-        updates.append("status = ?")
-        params.append(status)
-    if notes is not None:
-        updates.append("notes = ?")
-        params.append(notes)
-    if updates:
-        query = f"UPDATE attendance SET {', '.join(updates)} WHERE id = ?"
-        params.append(record_id)
-        conn.execute(query, params)
-        conn.commit()
-    conn.close()
+    """更新考勤记录"""
+    with sqlite3.connect(DB_FILE) as conn:
+        updates = []
+        params = []
+        if check_in is not None:
+            updates.append("check_in = ?")
+            params.append(check_in)
+        if check_out is not None:
+            updates.append("check_out = ?")
+            params.append(check_out)
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        if notes is not None:
+            updates.append("notes = ?")
+            params.append(notes)
+        if updates:
+            query = f"UPDATE attendance SET {', '.join(updates)} WHERE id = ?"
+            params.append(record_id)
+            conn.execute(query, params)
+            conn.commit()
     return True
 
 
 def get_month_calendar_data(user_id, year, month):
-    conn = get_db_connection()
+    """获取月历考勤数据"""
     start_date = f"{year}-{month:02d}-01"
     last_day = calendar.monthrange(year, month)[1]
     end_date = f"{year}-{month:02d}-{last_day}"
-    df = pd.read_sql_query("""
-        SELECT date, status
-        FROM attendance
-        WHERE user_id = ? AND date BETWEEN ? AND ?
-    """, conn, params=(user_id, start_date, end_date))
-    conn.close()
+    with sqlite3.connect(DB_FILE) as conn:
+        df = pd.read_sql_query("""
+            SELECT date, status
+            FROM attendance
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+        """, conn, params=(user_id, start_date, end_date))
     return df
 
 
@@ -966,11 +884,10 @@ def get_early_status_from_final(final_status):
 
 # ==================== 主程序逻辑 ====================
 
-init_db()
-
 if 'user' not in st.session_state:
     st.session_state.user = None
 
+# 未登录状态显示登录/注册界面
 if not st.session_state.user:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -995,9 +912,9 @@ if not st.session_state.user:
                 password = st.text_input("密码", type="password", placeholder="请输入密码")
                 submitted = st.form_submit_button("登 录", use_container_width=True)
                 if submitted:
-                    user = login_user(username, password)
+                    user = verify_login(username, password)
                     if user:
-                        st.session_state.user = dict(user)
+                        st.session_state.user = user
                         st.success(f"欢迎回来, {user['name']}")
                         st.rerun()
                     else:
@@ -1051,7 +968,7 @@ else:
     st.markdown(f"""
     <div class="app-header">
         <div class="title">{COMPANY_NAME}</div>
-        <div class="sub">{datetime.now().strftime("%Y年%m月%d日 %A")}</div>
+        <div class="sub">{datetime.now(BEIJING_TZ).strftime("%Y年%m月%d日 %A")}</div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1072,15 +989,15 @@ else:
     )
     selected = selected_top
 
-    # ========== 工作台 (移动端优化版) ==========
+    # ========== 工作台 ==========
     if selected == "工作台":
         st.title(f"👋 早安, {user['name']}")
-        st.markdown("今天是 " + datetime.now().strftime("%Y年%m月%d日 %A"))
+        st.markdown("今天是 " + datetime.now(BEIJING_TZ).strftime("%Y年%m月%d日 %A"))
 
         st.markdown("### 🕒 打卡签到")
-        
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        now_time_str = datetime.now().strftime("%H:%M:%S")
+
+        today_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+        now_time_str = datetime.now(BEIJING_TZ).strftime("%H:%M:%S")
         record = get_attendance_status(user['id'], today_str)
 
         col1, col2 = st.columns(2)
@@ -1129,17 +1046,20 @@ else:
             else:
                 st.markdown("🚫 请先完成上班打卡")
 
-    # ========== 我的考勤 (移动端优化版) ==========
+    # ========== 我的考勤 ==========
     elif selected == "我的考勤":
         st.title("📊 我的考勤记录")
 
         with st.expander("📅 考勤日历", expanded=False):
             col1, col2 = st.columns(2)
             with col1:
-                year = st.selectbox("年份", list(range(datetime.now().year - 1, datetime.now().year + 2)), index=1,
+                year = st.selectbox("年份",
+                                    list(range(datetime.now(BEIJING_TZ).year - 1, datetime.now(BEIJING_TZ).year + 2)),
+                                    index=1,
                                     key='cal_year')
             with col2:
-                month = st.selectbox("月份", list(range(1, 13)), index=datetime.now().month - 1, key='cal_month')
+                month = st.selectbox("月份", list(range(1, 13)), index=datetime.now(BEIJING_TZ).month - 1,
+                                     key='cal_month')
 
             cal_data = get_month_calendar_data(user['id'], year, month)
             cal = calendar.monthcalendar(year, month)
@@ -1156,18 +1076,16 @@ else:
                             cal_df.iloc[i, j] = f"{day} (未打卡)"
             st.dataframe(cal_df, use_container_width=True, hide_index=True)
 
-        conn = get_db_connection()
-        history = pd.read_sql_query(
-            "SELECT date, check_in, check_out, status FROM attendance WHERE user_id = ? ORDER BY date DESC", conn,
-            params=(user['id'],))
-        conn.close()
+        with sqlite3.connect(DB_FILE) as conn:
+            history = pd.read_sql_query(
+                "SELECT date, check_in, check_out, status FROM attendance WHERE user_id = ? ORDER BY date DESC",
+                conn, params=(user['id'],))
 
         total_days = len(history)
         normal_days = len(history[history['status'] == '正常'])
         late_days = len(history[history['status'].isin(['迟到', '迟到早退'])])
         early_days = len(history[history['status'].isin(['早退', '迟到早退'])])
 
-        # 移动端自适应：2列或4列
         col1, col2 = st.columns(2)
         metric_card("总出勤天数", total_days, col1)
         metric_card("正常出勤", normal_days, col2)
@@ -1221,15 +1139,14 @@ else:
             with col1:
                 leave_type = st.selectbox("请假类型", ["事假", "病假", "年假", "调休", "婚假", "产假", "丧假", "其他"])
             with col2:
-                # 移动端优化：让字段占满宽度
                 pass
-            
+
             reason = st.text_area("请假事由", placeholder="请详细说明请假原因...", height=80)
             col3, col4 = st.columns(2)
             with col3:
-                start_date = st.date_input("开始日期", min_value=datetime.now().date())
+                start_date = st.date_input("开始日期", min_value=datetime.now(BEIJING_TZ).date())
             with col4:
-                end_date = st.date_input("结束日期", min_value=datetime.now().date())
+                end_date = st.date_input("结束日期", min_value=datetime.now(BEIJING_TZ).date())
 
             submitted = st.form_submit_button("提交申请", type="primary", use_container_width=True)
 
@@ -1277,10 +1194,10 @@ else:
         with st.form("overtime_application_form"):
             col1, col2 = st.columns(2)
             with col1:
-                overtime_date = st.date_input("加班日期", min_value=datetime.now().date())
+                overtime_date = st.date_input("加班日期", min_value=datetime.now(BEIJING_TZ).date())
             with col2:
                 hours = st.number_input("加班时长(小时)", min_value=0.5, max_value=24.0, value=1.0, step=0.5)
-            
+
             reason = st.text_area("加班事由", placeholder="请说明加班原因...", height=80)
             submitted = st.form_submit_button("提交申请", type="primary", use_container_width=True)
 
@@ -1324,15 +1241,14 @@ else:
             st.title("🖥️ 管理员控制台")
 
             all_data = get_all_attendance()
-            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_str = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
             today_data = all_data[all_data['date'] == today_str]
 
             col1, col2 = st.columns(2)
             col3, col4 = st.columns(2)
-            
-            conn = get_db_connection()
-            total_employees = conn.execute("SELECT COUNT(*) FROM users WHERE role='employee'").fetchone()[0]
-            conn.close()
+
+            with sqlite3.connect(DB_FILE) as conn:
+                total_employees = conn.execute("SELECT COUNT(*) FROM users WHERE role='employee'").fetchone()[0]
 
             checked_in = len(today_data)
             late_count = len(today_data[today_data['status'].isin(['迟到', '迟到早退'])])
@@ -1448,7 +1364,7 @@ else:
             st.download_button(
                 label="📥 导出 CSV",
                 data=filtered_data.to_csv(index=False).encode('utf-8'),
-                file_name=f'attendance_report_{datetime.now().strftime("%Y%m%d")}.csv',
+                file_name=f'attendance_report_{datetime.now(BEIJING_TZ).strftime("%Y%m%d")}.csv',
                 mime='text/csv',
                 type="primary",
                 use_container_width=True
@@ -1483,21 +1399,19 @@ else:
                         dept_id = dept_map.get(new_dept)
                         ok, msg = register_user(new_username, new_password, new_name, dept_id)
                         if ok:
-                            conn = get_db_connection()
-                            conn.execute("UPDATE users SET role = ? WHERE username = ?", (new_role, new_username))
-                            conn.commit()
-                            conn.close()
+                            with sqlite3.connect(DB_FILE) as conn:
+                                conn.execute("UPDATE users SET role = ? WHERE username = ?", (new_role, new_username))
+                                conn.commit()
                             st.success("员工添加成功")
                             log_action(user['id'], '新增员工', f'用户名 {new_username}')
                             st.rerun()
                         else:
                             st.error(msg)
 
-        conn = get_db_connection()
-        users_df = pd.read_sql_query(
-            "SELECT u.id, u.username, u.name, u.role, u.department_id, d.name as department, u.email, u.phone FROM users u LEFT JOIN departments d ON u.department_id = d.id",
-            conn)
-        conn.close()
+        with sqlite3.connect(DB_FILE) as conn:
+            users_df = pd.read_sql_query(
+                "SELECT u.id, u.username, u.name, u.role, u.department_id, d.name as department, u.email, u.phone FROM users u LEFT JOIN departments d ON u.department_id = d.id",
+                conn)
 
         users_display = users_df.rename(columns={
             "id": "ID",
@@ -1588,25 +1502,24 @@ else:
 
                     col1, col2 = st.columns(2)
                     with col1:
-                        if st.button("✅ 批准", key=f"approve_leave_{row['id']}", use_container_width=True, type="primary"):
-                            conn = get_db_connection()
-                            conn.execute("""
-                                UPDATE leaves SET status = 'approved', approved_by = ?, approved_at = ?
-                                WHERE id = ?
-                            """, (user['id'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row['id']))
-                            conn.commit()
-                            conn.close()
+                        if st.button("✅ 批准", key=f"approve_leave_{row['id']}", use_container_width=True,
+                                     type="primary"):
+                            with sqlite3.connect(DB_FILE) as conn:
+                                conn.execute("""
+                                    UPDATE leaves SET status = 'approved', approved_by = ?, approved_at = ?
+                                    WHERE id = ?
+                                """, (user['id'], datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"), row['id']))
+                                conn.commit()
                             log_action(user['id'], '审批请假', f'批准请假 {row["id"]}')
                             st.success(f"已批准 {row['applicant_name']} 的请假申请")
                             st.rerun()
                     with col2:
                         if st.button("❌ 拒绝", key=f"reject_leave_{row['id']}", use_container_width=True):
-                            conn = get_db_connection()
-                            conn.execute(
-                                "UPDATE leaves SET status = 'rejected', approved_by = ?, approved_at = ? WHERE id = ?",
-                                (user['id'], datetime.now().strftime("%Y-%m-%d %H:%M:%S"), row['id']))
-                            conn.commit()
-                            conn.close()
+                            with sqlite3.connect(DB_FILE) as conn:
+                                conn.execute(
+                                    "UPDATE leaves SET status = 'rejected', approved_by = ?, approved_at = ? WHERE id = ?",
+                                    (user['id'], datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"), row['id']))
+                                conn.commit()
                             log_action(user['id'], '审批请假', f'拒绝请假 {row["id"]}')
                             st.warning(f"已拒绝 {row['applicant_name']} 的请假申请")
                             st.rerun()
@@ -1658,7 +1571,8 @@ else:
 
                     col1, col2 = st.columns(2)
                     with col1:
-                        if st.button("✅ 批准", key=f"approve_overtime_{row['id']}", use_container_width=True, type="primary"):
+                        if st.button("✅ 批准", key=f"approve_overtime_{row['id']}", use_container_width=True,
+                                     type="primary"):
                             if approve_overtime(row['id'], user['id'], 'approve'):
                                 st.success(f"已批准 {row['applicant_name']} 的加班申请")
                                 st.rerun()
@@ -1699,8 +1613,8 @@ else:
 
         with tab1:
             st.subheader("月度考勤统计")
-            current_year = datetime.now().year
-            current_month = datetime.now().month
+            current_year = datetime.now(BEIJING_TZ).year
+            current_month = datetime.now(BEIJING_TZ).month
 
             col1, col2 = st.columns(2)
             with col1:
@@ -1786,28 +1700,28 @@ else:
                                                      step=0.5)
 
                     if st.form_submit_button("保存规则", use_container_width=True, type="primary"):
-                        conn = get_db_connection()
-                        conn.execute("UPDATE attendance_rules SET is_active = 0")
-                        conn.execute("""
-                            INSERT INTO attendance_rules (rule_name, start_time, end_time, late_threshold, early_leave_threshold, work_hours_per_day, is_active, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (rule_name, start_time.strftime("%H:%M:%S"), end_time.strftime("%H:%M:%S"), late_threshold,
-                              early_leave_threshold, work_hours, 1, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                        conn.commit()
-                        conn.close()
+                        with sqlite3.connect(DB_FILE) as conn:
+                            conn.execute("UPDATE attendance_rules SET is_active = 0")
+                            conn.execute("""
+                                INSERT INTO attendance_rules (rule_name, start_time, end_time, late_threshold, early_leave_threshold, work_hours_per_day, is_active, created_at)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                            rule_name, start_time.strftime("%H:%M:%S"), end_time.strftime("%H:%M:%S"), late_threshold,
+                            early_leave_threshold, work_hours, 1,
+                            datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")))
+                            conn.commit()
                         log_action(user['id'], '修改考勤规则', f'新规则: {rule_name}')
                         st.success("考勤规则已保存")
                         st.rerun()
 
         with tab2:
             st.subheader("系统信息")
-            conn = get_db_connection()
-            user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            attendance_count = conn.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
-            leave_count = conn.execute("SELECT COUNT(*) FROM leaves").fetchone()[0]
-            overtime_count = conn.execute("SELECT COUNT(*) FROM overtime").fetchone()[0]
-            log_count = conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
-            conn.close()
+            with sqlite3.connect(DB_FILE) as conn:
+                user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+                attendance_count = conn.execute("SELECT COUNT(*) FROM attendance").fetchone()[0]
+                leave_count = conn.execute("SELECT COUNT(*) FROM leaves").fetchone()[0]
+                overtime_count = conn.execute("SELECT COUNT(*) FROM overtime").fetchone()[0]
+                log_count = conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
 
             st.markdown(f"""
             <div style="background-color: #f8f9fa; padding: 20px; border-radius: 10px;">
@@ -1818,7 +1732,7 @@ else:
                 <p><strong>加班记录数:</strong> {overtime_count}</p>
                 <p><strong>操作日志数:</strong> {log_count}</p>
                 <p><strong>数据库文件:</strong> {DB_FILE}</p>
-                <p><strong>最后更新时间:</strong> {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+                <p><strong>最后更新时间:</strong> {datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")}</p>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1828,7 +1742,7 @@ else:
                     st.download_button(
                         label="点击下载",
                         data=f,
-                        file_name=f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db",
+                        file_name=f"backup_{datetime.now(BEIJING_TZ).strftime('%Y%m%d_%H%M%S')}.db",
                         mime='application/octet-stream',
                         use_container_width=True
                     )
@@ -1849,7 +1763,7 @@ else:
             else:
                 st.info("暂无日志记录")
 
-    # ========== 个人中心（移动优化版） ==========
+    # ========== 个人中心 ==========
     elif selected == "个人中心":
         st.title("👤 个人中心")
 
@@ -1891,10 +1805,9 @@ else:
                         st.rerun()
                 if submitted:
                     if new_name and new_name != user['name']:
-                        conn = get_db_connection()
-                        conn.execute("UPDATE users SET name = ? WHERE id = ?", (new_name, user['id']))
-                        conn.commit()
-                        conn.close()
+                        with sqlite3.connect(DB_FILE) as conn:
+                            conn.execute("UPDATE users SET name = ? WHERE id = ?", (new_name, user['id']))
+                            conn.commit()
                         st.session_state.user['name'] = new_name
                         log_action(user['id'], '修改姓名', f'姓名改为 {new_name}')
                         st.success("姓名已更新")
@@ -1923,19 +1836,18 @@ else:
                     elif new_pwd != confirm_pwd:
                         st.error("两次输入的新密码不一致")
                     else:
-                        conn = get_db_connection()
-                        stored = conn.execute("SELECT password FROM users WHERE id = ?", (user['id'],)).fetchone()
-                        if stored and stored[0] == hash_password(old_pwd):
-                            conn.execute("UPDATE users SET password = ? WHERE id = ?", (hash_password(new_pwd), user['id']))
-                            conn.commit()
-                            conn.close()
-                            log_action(user['id'], '修改密码')
-                            st.success("密码已更新，请使用新密码登录")
-                            st.session_state.show_password_form = False
-                            st.rerun()
-                        else:
-                            conn.close()
-                            st.error("当前密码不正确")
+                        with sqlite3.connect(DB_FILE) as conn:
+                            stored = conn.execute("SELECT password FROM users WHERE id = ?", (user['id'],)).fetchone()
+                            if stored and stored[0] == hash_password(old_pwd):
+                                conn.execute("UPDATE users SET password = ? WHERE id = ?",
+                                             (hash_password(new_pwd), user['id']))
+                                conn.commit()
+                                log_action(user['id'], '修改密码')
+                                st.success("密码已更新，请使用新密码登录")
+                                st.session_state.show_password_form = False
+                                st.rerun()
+                            else:
+                                st.error("当前密码不正确")
 
         st.markdown("---")
 
