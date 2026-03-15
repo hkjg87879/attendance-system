@@ -1,7 +1,13 @@
-[client]
-showErrorDetails = false
+[theme]
+primaryColor = "#0D6EFD"
+backgroundColor = "#F7F9FC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2937"
+font = "inter"
 
 [server]
 headless = true
 runOnSave = true
-port = 8501
+address = "0.0.0.0"
+enableCORS = false
+port = 8502
